@@ -69,6 +69,7 @@ typedef enum pa_bluetooth_transport_state {
 typedef enum pa_bluetooth_codec {
     PA_BLUETOOTH_CODEC_CVSD,
     PA_BLUETOOTH_CODEC_SBC,
+    PA_BLUETOOTH_CODEC_MSBC,
 } pa_bluetooth_codec_t;
 
 typedef int (*pa_bluetooth_transport_acquire_cb)(pa_bluetooth_transport *t, bool optional, size_t *imtu, size_t *omtu);

@@ -48,6 +48,7 @@
 #include "a2dp-codecs.h"
 #include "bluez5-util.h"
 #include "rtp.h"
+#include "msbc.h"
 
 PA_MODULE_AUTHOR("João Paulo Rechi Vita");
 PA_MODULE_DESCRIPTION("BlueZ 5 Bluetooth audio sink and source");
@@ -95,15 +96,27 @@ PA_DEFINE_PRIVATE_CLASS(bluetooth_msg, pa_msgobject);
 
 typedef struct sbc_info {
     sbc_t sbc;                           /* Codec data */
+    sbc_t sbc_push;
     bool sbc_initialized;                /* Keep track if the encoder is initialized */
     size_t codesize, frame_length;       /* SBC Codesize, frame_length. We simply cache those values here */
     uint16_t seq_num;                    /* Cumulative packet sequence */
     uint8_t min_bitpool;
     uint8_t max_bitpool;
+    uint8_t msbc_seq:2;
+    uint16_t msbc_render_start;
+    uint16_t msbc_render_end;
+    uint16_t msbc_push_offset;
 
     void* buffer;                        /* Codec transfer buffer */
     size_t buffer_size;                  /* Size of the buffer */
 } sbc_info_t;
+
+/* the offset into the sbc_info.buffer_size where the push frame is
+ * found Note that the size of this offset must allow both an integral
+ * number of MTU packets and an integral number of msbc packets, so
+ * 240 is chosen being  4 * MSBC_PACKET_SIZE and 5 * 48 (48 being MTU)
+ */
+#define MSBC_PUSH_OFFSET	240
 
 struct userdata {
     pa_module *module;
@@ -427,6 +440,127 @@ static void sbc_prepare_buffer(struct userdata *u) {
     u->sbc_info.buffer = pa_xmalloc(u->sbc_info.buffer_size);
 }
 
+static void msbc_prepare_buffer(struct userdata *u)
+{
+    const size_t decode_size = MSBC_PUSH_OFFSET + MSBC_PACKET_SIZE;
+    struct sbc_info *si = &u->sbc_info;
+    if (si->buffer_size >= decode_size)
+        return;
+
+    si->buffer_size = decode_size;
+    pa_xfree(si->buffer);
+    si->buffer = pa_xmalloc(u->sbc_info.buffer_size);
+    si->msbc_render_start = 0;
+    si->msbc_render_end = 0;
+    si->msbc_push_offset = 0;
+}
+
+/* Run from IO thread */
+static int msbc_process_render(struct userdata *u) {
+    struct sbc_info *sbc_info;
+    struct msbc_frame *frame;
+    const void *p;
+    int ret = 0;
+    ssize_t written;
+    pa_memchunk memchunk;
+    uint8_t seq;
+
+    pa_assert(u);
+    pa_assert(u->transport->codec == PA_BLUETOOTH_CODEC_MSBC);
+    pa_assert(u->sink);
+
+    sbc_info = &u->sbc_info;
+
+    pa_sink_render_full(u->sink, u->write_block_size, &memchunk);
+
+    pa_assert(memchunk.length == sbc_info->codesize);
+
+    msbc_prepare_buffer(u);
+
+    p = (const uint8_t *) pa_memblock_acquire_chunk(&memchunk);
+
+    /* must be room to render packet */
+    pa_assert(sbc_info->msbc_render_end + MSBC_PACKET_SIZE <= MSBC_PUSH_OFFSET);
+
+    frame = (struct msbc_frame *)((uint8_t *)sbc_info->buffer + sbc_info->msbc_render_end);
+    seq = sbc_info->seq_num++;
+    frame->hdr.id0 = MSBC_H2_ID0;
+    frame->hdr.id1.s.id1 = MSBC_H2_ID1;
+    if (seq & 0x02)
+        frame->hdr.id1.s.sn1 = 3;
+    else
+        frame->hdr.id1.s.sn1 = 0;
+    if (seq & 0x01)
+        frame->hdr.id1.s.sn0 = 3;
+    else
+        frame->hdr.id1.s.sn0 = 0;
+
+    ret = sbc_encode(&sbc_info->sbc,
+                     p, memchunk.length,
+                     frame->payload, MSBC_FRAME_SIZE,
+                     &written);
+
+    frame->padding = 0x00;
+    pa_memblock_release(memchunk.memblock);
+
+    if (PA_UNLIKELY(ret <= 0)) {
+        pa_log_error("SBC encoding error (%li)", (long) ret);
+        pa_memblock_unref(memchunk.memblock);
+        return -1;
+    }
+
+    pa_assert_fp((size_t) ret == sbc_info->codesize);
+    pa_assert_fp((size_t) written == sbc_info->frame_length);
+
+    u->sbc_info.msbc_render_end += MSBC_PACKET_SIZE;
+
+    for (;;) {
+        ssize_t l = 0;
+
+        while (sbc_info->msbc_render_start + u->write_link_mtu
+               <= sbc_info->msbc_render_end) {
+            p = (uint8_t *)sbc_info->buffer + sbc_info->msbc_render_start;
+            l = pa_write(u->stream_fd, p, u->write_link_mtu,
+                         &u->stream_write_type);
+            if (l < 0)
+                break;
+            sbc_info->msbc_render_start += l;
+            if (sbc_info->msbc_render_start == sbc_info->msbc_render_end) {
+                sbc_info->msbc_render_start = 0;
+                sbc_info->msbc_render_end = 0;
+                break;
+            }
+
+            pa_assert_fp(sbc_info->msbc_render_start < sbc_info->msbc_render_end);
+        }
+
+        pa_assert(l != 0);
+
+        if (l < 0) {
+            if (errno == EINTR)
+                /* Retry right away if we got interrupted */
+                continue;
+
+            else if (errno == EAGAIN)
+                /* Hmm, apparently the socket was not writable, give up for now */
+                break;
+
+            pa_log_error("Failed to write data to socket: %s", pa_cstrerror(errno));
+            ret = -1;
+            break;
+        }
+
+        u->write_index += (uint64_t) memchunk.length;
+        pa_memblock_unref(memchunk.memblock);
+
+        ret = 1;
+
+        break;
+    }
+
+    return ret;
+}
+
 /* Run from IO thread */
 static int sbc_process_render(struct userdata *u) {
     struct sbc_info *sbc_info;
@@ -560,7 +694,147 @@ static int sbc_process_render(struct userdata *u) {
     return ret;
 }
 
+/*
+ * We build a msbc frame up in the sbc_info buffer until we have a whole one
+ */
+static struct msbc_frame *msbc_find_frame(struct sbc_info *si, ssize_t *len,
+                                          const uint8_t *buf, int *pseq)
+{
+    int i;
+    uint8_t *p = (uint8_t *)si->buffer + MSBC_PUSH_OFFSET;
+
+    for (i = 0; i < *len; i++) {
+        union msbc_h2_id1 id1;
+
+        if (si->msbc_push_offset == 0) {
+            if (buf[i] != MSBC_H2_ID0)
+                continue;
+        } else if (si->msbc_push_offset == 1) {
+            id1.b = buf[i];
+
+            if (id1.s.id1 != MSBC_H2_ID1)
+                goto error;
+            if (id1.s.sn0 != 3 && id1.s.sn0 != 0)
+                goto error;
+            if (id1.s.sn1 != 3 && id1.s.sn1 != 0)
+                goto error;
+        } else if (si->msbc_push_offset == 2) {
+            if (buf[i] != MSBC_SYNC_BYTE)
+                goto error;
+        }
+        p[si->msbc_push_offset++] = buf[i];
+
+        if (si->msbc_push_offset == MSBC_PACKET_SIZE) {
+            id1.b = p[1];
+            *pseq = (id1.s.sn0 & 0x1) | (id1.s.sn1 & 0x2);
+            si->msbc_push_offset = 0;
+            *len = *len - i;
+            return (struct msbc_frame *)p;
+        }
+        continue;
+
+        error:
+        si->msbc_push_offset = 0;
+    }
+    *len = 0;
+    return NULL;
+}
+
 /* Run from IO thread */
+static int msbc_process_push(struct userdata *u)
+{
+    int ret = 0;
+    pa_memchunk memchunk;
+
+    pa_assert(u);
+    pa_assert(u->transport->codec == PA_BLUETOOTH_CODEC_MSBC);
+    pa_assert(u->source);
+
+    memchunk.memblock = pa_memblock_new(u->core->mempool, u->read_block_size);
+    memchunk.index = memchunk.length = 0;
+
+    /* the assumption underlying this block is that the transmitted
+     * unit is small so the msbc frame is always fragmented.  If we
+     * start reading sizes > 1 whole frame, we would need to account
+     * for receiving multiple frames */
+    for (;;) {
+        ssize_t l, remaining;
+        size_t written;
+        struct sbc_info *sbc_info;
+        struct msbc_frame *frame;
+        pa_usec_t tstamp;
+        int seq;
+        uint8_t buf[u->read_link_mtu], lost;
+
+        msbc_prepare_buffer(u);
+
+        sbc_info = &u->sbc_info;
+
+        l = pa_read(u->stream_fd, buf, u->read_link_mtu, &u->stream_write_type);
+        tstamp = pa_rtclock_now();
+
+        if (l <= 0) {
+
+            if (l < 0 && errno == EINTR) {
+                /* Retry right away if we got interrupted */
+                continue;
+
+            } else if (l < 0 && errno == EAGAIN) {
+                /* Hmm, apparently the socket was not readable, give up for now. */
+                break;
+            }
+
+            pa_log_error("Failed to read data from socket: %s", l < 0 ? pa_cstrerror(errno) : "EOF");
+            ret = -1;
+            break;
+        }
+
+        remaining = l;
+        frame = msbc_find_frame(sbc_info, &remaining, buf, &seq);
+
+        /* only process when we have a full frame */
+        if (!frame)
+            break;
+
+        lost = (4 + seq - sbc_info->msbc_seq++) % 4;
+
+        if (lost) {
+            pa_log_error("Lost %d input audio packet(s)", lost);
+            sbc_info->msbc_seq = seq + 1;
+        }
+
+        ret = sbc_decode(&sbc_info->sbc_push, frame->payload, MSBC_FRAME_SIZE, pa_memblock_acquire(memchunk.memblock), pa_memblock_get_length(memchunk.memblock), &written);
+        /* now we've consumed the sbc_info buffer, start a new one with
+         * the partial frame we have */
+        if (remaining > 0)
+            msbc_find_frame(sbc_info, &remaining, buf + l - remaining, &seq);
+
+        pa_assert_fp(remaining == 0);
+
+        if (PA_UNLIKELY(ret <= 0)) {
+            pa_log_error("mSBC decoding error (%li)", (long) ret);
+            pa_memblock_release(memchunk.memblock);
+            pa_memblock_unref(memchunk.memblock);
+            return 0;
+        }
+        pa_assert_fp((size_t)ret == sbc_info->frame_length);
+        pa_assert_fp((size_t)written == sbc_info->codesize);
+
+        u->read_index += written * (lost + 1);
+        memchunk.length = written;
+        pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->sample_spec));
+        pa_smoother_resume(u->read_smoother, tstamp, true);
+
+        pa_memblock_release(memchunk.memblock);
+        pa_source_post(u->source, &memchunk);
+        ret = written;
+
+        break;
+    }
+    pa_memblock_unref(memchunk.memblock);
+    return ret;
+}
+
 static int sbc_process_push(struct userdata *u) {
     int ret = 0;
     pa_memchunk memchunk;
@@ -852,6 +1126,15 @@ static void transport_config_mtu(struct userdata *u) {
         || u->profile == PA_BLUETOOTH_PROFILE_HFP_AG) {
         u->read_block_size = u->read_link_mtu;
         u->write_block_size = u->write_link_mtu;
+
+        if (u->transport->codec == PA_BLUETOOTH_CODEC_MSBC) {
+            u->read_block_size = u->sbc_info.codesize;
+            u->write_block_size = u->sbc_info.codesize;
+            /* the packet fragmentation cannot work unless the
+             * mtu is the eSCO specified 48 */
+            u->read_link_mtu = 48;
+            u->write_link_mtu = 48;
+        }
 
         if (!pa_frame_aligned(u->read_block_size, &u->source->sample_spec)) {
             pa_log_debug("Got invalid read MTU: %lu, rounding down", u->read_block_size);
@@ -1306,6 +1589,24 @@ static void transport_config(struct userdata *u) {
         u->sample_spec.format = PA_SAMPLE_S16LE;
         u->sample_spec.channels = 1;
         u->sample_spec.rate = 8000;
+    } else if (u->transport->codec == PA_BLUETOOTH_CODEC_MSBC) {
+        sbc_info_t *sbc_info = &u->sbc_info;
+
+        u->sample_spec.format = PA_SAMPLE_S16LE;
+        u->sample_spec.channels = 1;
+        u->sample_spec.rate = 16000;
+        if (sbc_info->sbc_initialized) {
+            sbc_finish(&sbc_info->sbc);
+            sbc_finish(&sbc_info->sbc_push);
+        }
+        sbc_init_msbc(&sbc_info->sbc, 0);
+        sbc_init_msbc(&sbc_info->sbc_push, 0);
+        sbc_info->sbc_initialized = true;
+        sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
+        sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
+        pa_log_info("mSBC codesize=%d, frame_length=%d",
+                    (int)sbc_info->codesize,
+                    (int)sbc_info->frame_length);
     } else if (u->transport->codec == PA_BLUETOOTH_CODEC_SBC) {
         sbc_info_t *sbc_info = &u->sbc_info;
         a2dp_sbc_t *config;
@@ -1493,6 +1794,8 @@ static int write_block(struct userdata *u) {
         n_written = sbc_process_render(u);
     else if (u->transport->codec == PA_BLUETOOTH_CODEC_CVSD)
         n_written = sco_process_render(u);
+    else if (u->transport->codec == PA_BLUETOOTH_CODEC_MSBC)
+	n_written = msbc_process_render(u);
     else
 	pa_assert_not_reached();
 
@@ -1569,6 +1872,8 @@ static void thread_func(void *userdata) {
                         n_read = sbc_process_push(u);
                     else if (u->transport->codec == PA_BLUETOOTH_CODEC_CVSD)
                         n_read = sco_process_push(u);
+		    else if (u->transport->codec == PA_BLUETOOTH_CODEC_MSBC)
+		      n_read = msbc_process_push(u);
                     else
                         pa_assert_not_reached();
 
