@@ -66,6 +66,11 @@ typedef enum pa_bluetooth_transport_state {
     PA_BLUETOOTH_TRANSPORT_STATE_PLAYING
 } pa_bluetooth_transport_state_t;
 
+typedef enum pa_bluetooth_codec {
+    PA_BLUETOOTH_CODEC_CVSD,
+    PA_BLUETOOTH_CODEC_SBC,
+} pa_bluetooth_codec_t;
+
 typedef int (*pa_bluetooth_transport_acquire_cb)(pa_bluetooth_transport *t, bool optional, size_t *imtu, size_t *omtu);
 typedef void (*pa_bluetooth_transport_release_cb)(pa_bluetooth_transport *t);
 typedef void (*pa_bluetooth_transport_destroy_cb)(pa_bluetooth_transport *t);
@@ -79,7 +84,7 @@ struct pa_bluetooth_transport {
     char *path;
     pa_bluetooth_profile_t profile;
 
-    uint8_t codec;
+    pa_bluetooth_codec_t codec;
     void *config;
     size_t config_size;
 

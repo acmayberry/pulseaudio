@@ -147,6 +147,11 @@ pa_bluetooth_transport *pa_bluetooth_transport_new(pa_bluetooth_device *d, const
     t->path = pa_xstrdup(path);
     t->profile = p;
     t->config_size = size;
+    if (p == PA_BLUETOOTH_PROFILE_A2DP_SINK ||
+        p == PA_BLUETOOTH_PROFILE_A2DP_SOURCE)
+        t->codec = PA_BLUETOOTH_CODEC_SBC;
+    else
+        t->codec = PA_BLUETOOTH_CODEC_CVSD;
 
     if (size > 0) {
         t->config = pa_xnew(uint8_t, size);

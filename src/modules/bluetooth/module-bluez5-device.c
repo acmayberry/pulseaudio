@@ -414,7 +414,7 @@ static int sco_process_push(struct userdata *u) {
 }
 
 /* Run from IO thread */
-static void a2dp_prepare_buffer(struct userdata *u) {
+static void sbc_prepare_buffer(struct userdata *u) {
     size_t min_buffer_size = PA_MAX(u->read_link_mtu, u->write_link_mtu);
 
     pa_assert(u);
@@ -428,7 +428,7 @@ static void a2dp_prepare_buffer(struct userdata *u) {
 }
 
 /* Run from IO thread */
-static int a2dp_process_render(struct userdata *u) {
+static int sbc_process_render(struct userdata *u) {
     struct sbc_info *sbc_info;
     struct rtp_header *header;
     struct rtp_payload *payload;
@@ -440,7 +440,7 @@ static int a2dp_process_render(struct userdata *u) {
     int ret = 0;
 
     pa_assert(u);
-    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK);
+    pa_assert(u->transport->codec == PA_BLUETOOTH_CODEC_SBC);
     pa_assert(u->sink);
 
     /* First, render some data */
@@ -449,7 +449,7 @@ static int a2dp_process_render(struct userdata *u) {
 
     pa_assert(u->write_memchunk.length == u->write_block_size);
 
-    a2dp_prepare_buffer(u);
+    sbc_prepare_buffer(u);
 
     sbc_info = &u->sbc_info;
     header = sbc_info->buffer;
@@ -561,12 +561,12 @@ static int a2dp_process_render(struct userdata *u) {
 }
 
 /* Run from IO thread */
-static int a2dp_process_push(struct userdata *u) {
+static int sbc_process_push(struct userdata *u) {
     int ret = 0;
     pa_memchunk memchunk;
 
     pa_assert(u);
-    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE);
+    pa_assert(u->transport->codec == PA_BLUETOOTH_CODEC_SBC);
     pa_assert(u->source);
     pa_assert(u->read_smoother);
 
@@ -585,7 +585,7 @@ static int a2dp_process_push(struct userdata *u) {
         size_t to_write, to_decode;
         size_t total_written = 0;
 
-        a2dp_prepare_buffer(u);
+        sbc_prepare_buffer(u);
 
         sbc_info = &u->sbc_info;
         header = sbc_info->buffer;
@@ -707,7 +707,7 @@ static void update_buffer_size(struct userdata *u) {
 }
 
 /* Run from I/O thread */
-static void a2dp_set_bitpool(struct userdata *u, uint8_t bitpool) {
+static void sbc_set_bitpool(struct userdata *u, uint8_t bitpool) {
     struct sbc_info *sbc_info;
 
     pa_assert(u);
@@ -752,7 +752,7 @@ static void a2dp_set_bitpool(struct userdata *u, uint8_t bitpool) {
 }
 
 /* Run from I/O thread */
-static void a2dp_reduce_bitpool(struct userdata *u) {
+static void sbc_reduce_bitpool(struct userdata *u) {
     struct sbc_info *sbc_info;
     uint8_t bitpool;
 
@@ -769,7 +769,7 @@ static void a2dp_reduce_bitpool(struct userdata *u) {
     if (bitpool < BITPOOL_DEC_LIMIT)
         bitpool = BITPOOL_DEC_LIMIT;
 
-    a2dp_set_bitpool(u, bitpool);
+    sbc_set_bitpool(u, bitpool);
 }
 
 static void teardown_stream(struct userdata *u) {
@@ -910,8 +910,8 @@ static void setup_stream(struct userdata *u) {
     pa_log_debug("Stream properly set up, we're ready to roll!");
 
     if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
-        a2dp_set_bitpool(u, u->sbc_info.max_bitpool);
-        update_buffer_size(u);
+        sbc_set_bitpool(u, u->sbc_info.max_bitpool);
+	update_buffer_size(u);
     }
 
     u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
@@ -1302,13 +1302,11 @@ static int add_sink(struct userdata *u) {
 
 /* Run from main thread */
 static void transport_config(struct userdata *u) {
-    if (u->profile == PA_BLUETOOTH_PROFILE_HSP_HS
-        || u->profile == PA_BLUETOOTH_PROFILE_HFP_HF
-        || u->profile == PA_BLUETOOTH_PROFILE_HFP_AG) {
+    if (u->transport->codec == PA_BLUETOOTH_CODEC_CVSD) {
         u->sample_spec.format = PA_SAMPLE_S16LE;
         u->sample_spec.channels = 1;
         u->sample_spec.rate = 8000;
-    } else {
+    } else if (u->transport->codec == PA_BLUETOOTH_CODEC_SBC) {
         sbc_info_t *sbc_info = &u->sbc_info;
         a2dp_sbc_t *config;
 
@@ -1491,13 +1489,15 @@ static int write_block(struct userdata *u) {
     if (u->write_index <= 0)
         u->started_at = pa_rtclock_now();
 
-    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
-        if ((n_written = a2dp_process_render(u)) < 0)
-            return -1;
-    } else {
-        if ((n_written = sco_process_render(u)) < 0)
-            return -1;
-    }
+    if (u->transport->codec == PA_BLUETOOTH_CODEC_SBC)
+        n_written = sbc_process_render(u);
+    else if (u->transport->codec == PA_BLUETOOTH_CODEC_CVSD)
+        n_written = sco_process_render(u);
+    else
+	pa_assert_not_reached();
+
+    if (n_written < 0)
+	n_written = -1;
 
     return n_written;
 }
@@ -1565,10 +1565,12 @@ static void thread_func(void *userdata) {
                 if (pollfd->revents & POLLIN) {
                     int n_read;
 
-                    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE)
-                        n_read = a2dp_process_push(u);
-                    else
+                    if (u->transport->codec == PA_BLUETOOTH_CODEC_SBC)
+                        n_read = sbc_process_push(u);
+                    else if (u->transport->codec == PA_BLUETOOTH_CODEC_CVSD)
                         n_read = sco_process_push(u);
+                    else
+                        pa_assert_not_reached();
 
                     if (n_read < 0)
                         goto fail;
@@ -1666,7 +1668,7 @@ static void thread_func(void *userdata) {
                             }
 
                             if (u->write_index > 0 && u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK)
-                                a2dp_reduce_bitpool(u);
+                                sbc_reduce_bitpool(u);
                         }
 
                         blocks_to_write = 1;
